@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PDF Markup Service</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    .card { max-width: 1360px; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; }
+    h1 { margin: 0 0 12px; font-size: 20px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    input[type="file"] { padding: 8px; }
+    button { padding: 10px 14px; border: 0; border-radius: 10px; background: #111827; color: white; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #0b1020; color: #e5e7eb; padding: 12px; border-radius: 12px; overflow: auto; }
+    .hint { color: #6b7280; font-size: 13px; margin-top: 8px; }
+    .viewer { margin-top: 16px; display: none; }
+    .viewer-row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: nowrap; }
+    .canvas-wrap { position: relative; display: inline-block; flex: 1 1 auto; min-width: 640px; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; background: #fff; }
+    .canvas-wrap img { display: block; width: 100%; height: auto; }
+    .box { position: absolute; border: 2px solid; background: rgba(255, 0, 0, 0.2); pointer-events: none; }
+    .box.qr { border-color: #ef4444; background: rgba(239, 68, 68, 0.2); }
+    .box.table { border-color: #f59e0b; background: rgba(245, 158, 11, 0.18); }
+    .box.formula { border-color: #7c3aed; background: rgba(124, 58, 237, 0.2); }
+    .box-label { position: absolute; top: -20px; left: -2px; font-size: 12px; line-height: 16px; padding: 1px 6px; border-radius: 6px; color: #fff; background: rgba(17, 24, 39, 0.9); }
+    .errors { flex: 0 0 420px; width: 420px; max-height: 78vh; overflow: auto; }
+    .err { border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; background: #fafafa; }
+    .err-title { font-weight: 600; margin-bottom: 4px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Загрузка PDF → NER (JSON)</h1>
+    <div class="row">
+      <input id="file" type="file" accept="application/pdf,.pdf" />
+      <label style="display:flex;align-items:center;gap:8px;">
+        <input id="use_gpu" type="checkbox" />
+        Использовать GPU (EasyOCR)
+      </label>
+      <button id="btn">Обработать</button>
+    </div>
+    <div class="hint">Ответ: <code>job_id</code>, <code>ner</code>, <code>validation</code>, <code>validation_view</code>, <code>report_url</code>.</div>
+    <div class="row" style="margin-top:10px;">
+      <label>Страница ошибок:
+        <select id="pageSelect"></select>
+      </label>
+      <a id="reportLink" href="#" download style="display:none;text-decoration:none;">
+        <button type="button">Скачать отчёт</button>
+      </a>
+    </div>
+    <div id="viewer" class="viewer">
+      <div class="viewer-row">
+        <div id="canvasWrap" class="canvas-wrap"></div>
+        <div class="errors">
+          <h3 style="margin-top:0;">Ошибки страницы</h3>
+          <div id="errorsList"></div>
+        </div>
+      </div>
+    </div>
+    <h3>Ответ</h3>
+    <pre id="out">{}</pre>
+  </div>
+
+  <script>
+    const btn = document.getElementById('btn');
+    const fileEl = document.getElementById('file');
+    const gpuEl = document.getElementById('use_gpu');
+    const out = document.getElementById('out');
+    const pageSelect = document.getElementById('pageSelect');
+    const viewer = document.getElementById('viewer');
+    const canvasWrap = document.getElementById('canvasWrap');
+    const errorsList = document.getElementById('errorsList');
+    const reportLink = document.getElementById('reportLink');
+    let pageMap = {};
+    function dbg(location, message, data, hypothesisId='UI1') {
+      // #region agent log
+      fetch('http://127.0.0.1:7372/ingest/039faedb-35f4-42ee-b5cb-8e8384238a05',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'a34a8d'},body:JSON.stringify({sessionId:'a34a8d',runId:`ui-${Date.now()}`,hypothesisId,location,message,data,timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+    }
+
+    function renderPage(pageNum) {
+      const pg = pageMap[String(pageNum)];
+      if (!pg) return;
+      canvasWrap.innerHTML = '';
+      errorsList.innerHTML = '';
+      const img = document.createElement('img');
+      img.src = pg.image_url;
+      img.alt = `page ${pageNum}`;
+      img.onload = () => {
+        const nw = img.naturalWidth || 1;
+        const nh = img.naturalHeight || 1;
+        (pg.highlights || []).forEach(h => {
+          const div = document.createElement('div');
+          div.className = `box ${h.kind || ''}`;
+          div.style.left = `${((h.x || 0) / nw) * 100}%`;
+          div.style.top = `${((h.y || 0) / nh) * 100}%`;
+          div.style.width = `${((h.w || 0) / nw) * 100}%`;
+          div.style.height = `${((h.h || 0) / nh) * 100}%`;
+          if (h.label) {
+            const label = document.createElement('div');
+            label.className = 'box-label';
+            label.textContent = h.label;
+            div.appendChild(label);
+          }
+          canvasWrap.appendChild(div);
+        });
+      };
+      canvasWrap.appendChild(img);
+      (pg.messages || []).forEach(m => {
+        const item = document.createElement('div');
+        item.className = 'err';
+        item.innerHTML = `<div class="err-title">${m.title || m.kind}</div><div>${m.text || ''}</div>`;
+        errorsList.appendChild(item);
+      });
+      dbg('index.html:renderPage','rendered page messages and highlights',{page: Number(pageNum), messages: (pg.messages||[]).map(x=>x.title), highlights: (pg.highlights||[]).map(h=>h.label||h.kind)},'UI2');
+      if (!(pg.messages || []).length) {
+        const item = document.createElement('div');
+        item.className = 'err';
+        item.innerHTML = `<div class="err-title">Ошибок не найдено</div><div>Для этой страницы валидация не нашла расхождений.</div>`;
+        errorsList.appendChild(item);
+      }
+    }
+
+    btn.addEventListener('click', async () => {
+      if (!fileEl.files || !fileEl.files[0]) {
+        out.textContent = "Выберите PDF файл";
+        return;
+      }
+
+      btn.disabled = true;
+      out.textContent = "Обработка... (может занять время)";
+
+      try {
+        const fd = new FormData();
+        fd.append('file', fileEl.files[0]);
+        fd.append('use_gpu', gpuEl.checked ? 'true' : 'false');
+
+        const resp = await fetch('/api/parse', { method: 'POST', body: fd });
+        const data = await resp.json().catch(() => ({}));
+
+        if (!resp.ok) {
+          out.textContent = JSON.stringify({ error: data }, null, 2);
+          return;
+        }
+        out.textContent = JSON.stringify(data, null, 2);
+        const pages = (data.validation_view && data.validation_view.pages) || [];
+        dbg('index.html:parse_response','received validation_view payload',{pages: pages.map(p=>({page:p.page,msgCount:(p.messages||[]).length,msgTitles:(p.messages||[]).map(m=>m.title)}))},'UI1');
+        pageMap = Object.fromEntries(pages.map(p => [String(p.page), p]));
+        pageSelect.innerHTML = pages.map(p => `<option value="${p.page}">Стр. ${p.page}</option>`).join('');
+        viewer.style.display = pages.length ? 'block' : 'none';
+        if (pages.length) renderPage(pages[0].page);
+        if (data.report_url) {
+          reportLink.href = data.report_url;
+          reportLink.style.display = 'inline-block';
+        } else {
+          reportLink.style.display = 'none';
+        }
+      } catch (e) {
+        out.textContent = String(e);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    pageSelect.addEventListener('change', (e) => renderPage(e.target.value));
+  </script>
+</body>
+</html>
+
